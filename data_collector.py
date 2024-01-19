@@ -19,6 +19,7 @@ import open3d as o3d
 
 from examples.synchronous_mode import CarlaSyncMode
 from examples.automatic_control import World, HUD, KeyboardControl, BehaviorAgent, BasicAgent, get_actor_display_name
+from examples.generate_traffic import get_actor_blueprints
 from examples.automatic_control import CollisionSensor, LaneInvasionSensor, GnssSensor
 from utils import vector3d_to_array, Timer
 from bounding_box import create_kitti_datapoint
@@ -277,10 +278,14 @@ class CarlaGame(object):
             (args.width, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
         client = carla.Client(args.host, args.port)
-        client.set_timeout(4.0)
+        client.set_timeout(60.0)
         client.reload_world()
         self.hud = HUD(args.width, args.height)
         self.world = World(client.get_world(), self.hud, args)
+
+        ## Add Traffic Manager Here
+        self.tm = client.get_trafficmanager(args.tmport)
+        self.client = client
 
         self.controller = KeyboardControl(self.world)
         if (args.autopilot == False):
@@ -289,12 +294,13 @@ class CarlaGame(object):
             self.spawn_points = self.world.map.get_spawn_points()
             random.shuffle(self.spawn_points)
 
-            if self.spawn_points[0].location != self.agent.vehicle.get_location():
+            if self.spawn_points[0].location != self.agent._vehicle.get_location():
                 destination = self.spawn_points[0].location
             else:
                 destination = self.spawn_points[1].location
 
-            self.agent.set_destination(self.agent.vehicle.get_location(), destination, clean=True)
+            # self.agent.set_destination(self.agent._vehicle.get_location(), destination, clean=True)
+            self.agent.set_destination(destination, self.agent._vehicle.get_location())
 
     def current_captured_frame_num(self, args):
         # Figures out which frame number we currently are on
@@ -317,6 +323,17 @@ class CarlaGame(object):
         logging.info("Continuing recording data on frame number {}".format(
             num_existing_data_files))
         return num_existing_data_files
+    
+    ## Reimplement of deprecated reroute
+    def agent_reroute(self, spawn_points):
+        print("Target almost reached, setting new destination...")
+        random.shuffle(spawn_points)
+        new_start = self.agent.get_local_planner()._waypoints_queue[-1][0].transform.location
+        destination = spawn_points[0].location if spawn_points[0].location != new_start else spawn_points[1].location
+        print("New destination: " + str(destination))
+
+        self.agent.set_destination(destination, new_start)
+        pass
 
     def _on_new_episode(self, args):
         logging.info('Starting a new episode...')
@@ -331,7 +348,10 @@ class CarlaGame(object):
         self._captured_frames_since_restart = 0
 
         if (args.autopilot == False):
-            self.agent.reroute(self.spawn_points)
+            # self.agent.reroute(self.spawn_points)
+            ## Reroute Deprecated in 0.9.15
+            self.agent_reroute(self.spawn_points)
+            pass
 
     def _distance_since_last_recording(self):
         if self._agent_location_on_last_capture is None:
@@ -558,14 +578,157 @@ class CarlaGame(object):
                     processed_data.update({sensor_key: {'image': array}})
 
         return processed_data
+    
+    def configure_tm(self, args):
+        vehicles_list = []
+        walkers_list = []
+        all_id = []
+        world = self.client.get_world()
+
+        blueprints = get_actor_blueprints(world, "vehicle.*", "All")        
+        if not blueprints:
+            raise ValueError("Couldn't find any vehicles with the specified filters")
+        blueprintsWalkers = get_actor_blueprints(world, "walker.pedestrian.*", "2")
+        if not blueprintsWalkers:
+            raise ValueError("Couldn't find any walkers with the specified filters")        
+
+        blueprints = sorted(blueprints, key=lambda bp: bp.id)
+
+        spawn_points = world.get_map().get_spawn_points()
+        number_of_spawn_points = len(spawn_points)
+
+        if args.number_of_vehicles < number_of_spawn_points:
+            random.shuffle(spawn_points)
+        elif args.number_of_vehicles > number_of_spawn_points:
+            msg = 'requested %d vehicles, but could only find %d spawn points'
+            logging.warning(msg, args.number_of_vehicles, number_of_spawn_points)
+            args.number_of_vehicles = number_of_spawn_points
+
+        # @todo cannot import these directly.
+        SpawnActor = carla.command.SpawnActor
+        SetAutopilot = carla.command.SetAutopilot
+        FutureActor = carla.command.FutureActor
+
+        # --------------
+        # Spawn vehicles
+        # --------------
+        batch = []        
+        for n, transform in enumerate(spawn_points):
+            if n >= args.number_of_vehicles:
+                break
+            blueprint = random.choice(blueprints)
+            if blueprint.has_attribute('color'):
+                color = random.choice(blueprint.get_attribute('color').recommended_values)
+                blueprint.set_attribute('color', color)
+            if blueprint.has_attribute('driver_id'):
+                driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
+                blueprint.set_attribute('driver_id', driver_id)            
+            blueprint.set_attribute('role_name', 'autopilot')
+
+            # spawn the cars and set their autopilot and light state all together
+            batch.append(SpawnActor(blueprint, transform)
+                .then(SetAutopilot(FutureActor, True, self.tm.get_port())))
+
+        for response in self.client.apply_batch_sync(batch, True):
+            if response.error:
+                logging.error(response.error)
+            else:
+                vehicles_list.append(response.actor_id)
+
+        # Set automatic vehicle lights update if specified        
+        all_vehicle_actors = world.get_actors(vehicles_list)
+        for actor in all_vehicle_actors:
+            lights_on_flag = True if random.random() > 0.5 else False
+            self.tm.update_vehicle_lights(actor, True)
+
+        # -------------
+        # Spawn Walkers
+        # -------------
+        # some settings
+        percentagePedestriansRunning = 0.0      # how many pedestrians will run
+        percentagePedestriansCrossing = 0.0     # how many pedestrians will walk through the road        
+        # 1. take all the random locations to spawn
+        spawn_points = []
+        for i in range(args.number_of_walkers):
+            spawn_point = carla.Transform()
+            loc = world.get_random_location_from_navigation()
+            if (loc != None):
+                spawn_point.location = loc
+                spawn_points.append(spawn_point)
+        # 2. we spawn the walker object
+        batch = []
+        walker_speed = []
+        for spawn_point in spawn_points:
+            walker_bp = random.choice(blueprintsWalkers)
+            # set as not invincible
+            if walker_bp.has_attribute('is_invincible'):
+                walker_bp.set_attribute('is_invincible', 'false')
+            # set the max speed
+            if walker_bp.has_attribute('speed'):
+                if (random.random() > percentagePedestriansRunning):
+                    # walking
+                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[1])
+                else:
+                    # running
+                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[2])
+            else:
+                print("Walker has no speed")
+                walker_speed.append(0.0)
+            batch.append(SpawnActor(walker_bp, spawn_point))
+        results = self.client.apply_batch_sync(batch, True)
+        walker_speed2 = []
+        for i in range(len(results)):
+            if results[i].error:
+                logging.error(results[i].error)
+            else:
+                walkers_list.append({"id": results[i].actor_id})
+                walker_speed2.append(walker_speed[i])
+        walker_speed = walker_speed2
+        # 3. we spawn the walker controller
+        batch = []
+        walker_controller_bp = world.get_blueprint_library().find('controller.ai.walker')
+        for i in range(len(walkers_list)):
+            batch.append(SpawnActor(walker_controller_bp, carla.Transform(), walkers_list[i]["id"]))
+        results = self.client.apply_batch_sync(batch, True)
+        for i in range(len(results)):
+            if results[i].error:
+                logging.error(results[i].error)
+            else:
+                walkers_list[i]["con"] = results[i].actor_id
+        # 4. we put together the walkers and controllers id to get the objects from their id
+        for i in range(len(walkers_list)):
+            all_id.append(walkers_list[i]["con"])
+            all_id.append(walkers_list[i]["id"])
+        all_actors = world.get_actors(all_id)
+
+        
+        world.tick()
+
+        # 5. initialize each controller and set target to walk to (list is [controler, actor, controller, actor ...])
+        # set how many pedestrians can cross the road
+        world.set_pedestrians_cross_factor(percentagePedestriansCrossing)
+        for i in range(0, len(all_id), 2):
+            # start walker
+            all_actors[i].start()
+            # set walk to random point
+            all_actors[i].go_to_location(world.get_random_location_from_navigation())
+            # max speed
+            all_actors[i].set_max_speed(float(walker_speed[int(i/2)]))
+
+        print('spawned %d vehicles and %d walkers, press Ctrl+C to exit.' % (len(vehicles_list), len(walkers_list)))
+
+        # Example of how to use Traffic Manager parameters
+        self.tm.global_percentage_speed_difference(30.0)
 
     def game_loop(self, args):
-        """ Main loop for agent"""
+        """ Main loop for agent"""        
 
         sensors = [val['sensor'] for val in self.world.camera_manager.sensors.values()]
         # Create a synchronous mode context.
-        with CarlaSyncMode(self.world.world, *sensors, fps=args.fps) as sync_mode:
-            while True:
+        with CarlaSyncMode(self.world.world, *sensors, fps=args.fps) as sync_mode:            
+            self.configure_tm(args)            
+
+            while True:                
                 if self.controller.parse_events():
                     return
                 self._timer.tick()
@@ -595,10 +758,11 @@ class CarlaGame(object):
                     self._on_new_episode(args)
                     # If we dont sleep, the client will continue to render
                     self.reset_episode = True
-                    continue
+                    continue                
 
                 if (args.autopilot == False):
-                    self.agent.update_information(self.world)
+                    # self.agent.update_information(self.world)
+                    self.agent._update_information()
 
                 # Tick HUD
                 self.world.tick(self.clock)
@@ -610,7 +774,7 @@ class CarlaGame(object):
                 datapoints = self._render(self.display, processed_sensor_data, args)
 
                 # Rendering HUD
-                self.world.render(self.display)
+                self.world.render(self.display)                
                 pygame.display.flip()
 
                 if args.save_data:
@@ -637,7 +801,7 @@ class CarlaGame(object):
                 if (args.autopilot == False):
                     # Set new destination when target has been reached
                     if len(self.agent.get_local_planner()._waypoints_queue) < self.num_min_waypoints and args.loop:
-                        self.agent.reroute(self.spawn_points)
+                        self.agent_reroute(self.spawn_points)
                         self.tot_target_reached += 1
                         self.world.hud.notification("The target has been reached " +
                                                str(self.tot_target_reached) + " times.", seconds=4.0)
@@ -651,6 +815,10 @@ class CarlaGame(object):
 
                     control = self.agent.run_step()
                     self.world.player.apply_control(control)
+    
+    def tm_cleanse(self):
+        ## To-DO        
+        pass
 
 def main():
     """Main method"""
@@ -673,6 +841,24 @@ def main():
         default=2000,
         type=int,
         help='TCP port to listen to (default: 2000)')
+    argparser.add_argument(
+        '-tmp', '--tmport',
+        metavar='P',
+        default=8000,
+        type=int,
+        help='Traffic Manager TCP port to listen to (default: 8000)')
+    argparser.add_argument(
+        '-n', '--number-of-vehicles',
+        metavar='N',
+        default=30,
+        type=int,
+        help='Number of vehicles (default: 30)')
+    argparser.add_argument(
+        '-w', '--number-of-walkers',
+        metavar='W',
+        default=10,
+        type=int,
+        help='Number of walkers (default: 10)')
     argparser.add_argument(
         '--res',
         metavar='WIDTHxHEIGHT',
@@ -789,14 +975,14 @@ def main():
 
     # TODO this is a workaround for spawning pedestrians and vehicles. In future should be replaced by
     #  scenario runner configs
-    spawn_npc_path = os.path.join(carla_root, 'PythonAPI', 'examples', 'generate_traffic.py')
+    # spawn_npc_path = os.path.join(carla_root, 'PythonAPI', 'examples', 'generate_traffic.py')
 
-    def target(**kwargs):
-        process = subprocess.Popen([spawn_npc_path, '-w 200'], **kwargs)
-        process.communicate()
+    # def target(**kwargs):
+    #     process = subprocess.Popen([spawn_npc_path, '-w 200'], **kwargs)
+    #     process.communicate()
 
-    thread = threading.Thread(target=target, kwargs={'stdout':subprocess.PIPE, 'shell':True})
-    thread.start()
+    # thread = threading.Thread(target=target, kwargs={'stdout':subprocess.PIPE, 'shell':True})
+    # thread.start()
 
     args = argparser.parse_args()
     phase_dir = os.path.join(args.output_dir, args.phase)
@@ -852,12 +1038,16 @@ def main():
 
     print(__doc__)
 
+    ## Bug Fix
+    args.generation = 2
     carla_game = CarlaGame(args)
     try:
 
         carla_game.game_loop(args)
 
     except KeyboardInterrupt:
+        ## TO-DO Disable Traffic Manager Here..
+        carla_game.tm_cleanse()
         print('\nCancelled by user. Bye!')
 
 
