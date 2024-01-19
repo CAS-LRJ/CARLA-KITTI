@@ -3,3 +3,4 @@
 /data/
 /dataset_reports/
 /.ipynb_checkpoints/
+__pycache__/
